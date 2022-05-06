@@ -83,6 +83,8 @@ func (k *KafkaFranz) Init(cfg *config.Config, taskCfg *config.TaskConfig, putFn 
 		kgo.BrokerMaxReadBytes(1 << 27), //134 MB
 		//kgo.MetadataMaxAge(...) corresponds to sarama.Config.Metadata.RefreshFrequency
 		kgo.WithLogger(kzap.New(util.Logger)),
+		//modify partition assignment
+		kgo.Balancers(kgo.RangeBalancer()),
 	}
 	if !taskCfg.Earliest {
 		opts = append(opts, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
