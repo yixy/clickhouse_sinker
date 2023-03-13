@@ -1,10 +1,11 @@
-/*Copyright [2019] housepower
+/*
+Copyright [2019] housepower
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-   http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +43,7 @@ var jsonSample = []byte(`{
 	"bool_false": false,
 	"num_int": 123,
 	"num_float": 123.321,
+	"app.kubernetes.io/name": "kube-state-metrics",
 	"str": "escaped_\"ws",
 	"str_int": "123",
 	"str_float": "123.321",
@@ -65,15 +68,24 @@ var jsonSample = []byte(`{
 	"array_str_date_2": ["13/07/2009","14/07/2009","15/07/2009"],
 	"array_str_time_rfc3339": ["2009-07-13T09:07:13Z", "2009-07-13T09:07:13+08:00", "2009-07-13T09:07:13.123Z", "2009-07-13T09:07:13.123+08:00"],
 	"array_str_time_clickhouse": ["2009-07-13 09:07:13", "2009-07-13 09:07:13.123"],
-	"array_obj": [{"i":[1,2,3],"f":[1.1,2.2,3.3]},{"s":["aa","bb","cc"],"e":[]}]
+	"array_obj": [{"i":[1,2,3],"f":[1.1,2.2,3.3]},{"s":["aa","bb","cc"],"e":[]}],
+	"map_str_str": {"i":"first", "j":"second"},
+	"map_str_uint": {"i":1, "j":2},
+	"map_str_int": {"i":-1, "j":-2},
+	"map_str_float": {"i":3.1415, "j":9.876},
+	"map_str_bool": {"i":true, "j":false},
+	"map_str_date": {"i":"2008-08-08", "j":"2022-01-01"},
+	"map_str_array": {"i":[1,2,3],"j":[4,5,6]},
+	"map_str_map": {"i":{"i":1, "j":2}, "j":{"i":3, "j":4}}
 }`)
 
 var jsonSchema = map[string]string{
 	"null":                      "Unknown",
-	"bool_true":                 "Int",
-	"bool_false":                "Int",
-	"num_int":                   "Int",
-	"num_float":                 "Float",
+	"bool_true":                 "Bool",
+	"bool_false":                "Bool",
+	"num_int":                   "Int64",
+	"num_float":                 "Float64",
+	"app.kubernetes.io/name":    "String",
 	"str":                       "String",
 	"str_int":                   "String",
 	"str_float":                 "String",
@@ -83,13 +95,13 @@ var jsonSchema = map[string]string{
 	"str_time_rfc3339_2":        "DateTime",
 	"str_time_clickhouse_1":     "DateTime",
 	"str_time_clickhouse_2":     "DateTime",
-	"obj":                       "String",
+	"obj":                       "Object('json')",
 	"array_empty":               "Unknown",
 	"array_null":                "Unknown",
-	"array_bool":                "IntArray",
-	"array_num_int_1":           "IntArray",
-	"array_num_int_2":           "IntArray",
-	"array_num_float":           "FloatArray",
+	"array_bool":                "BoolArray",
+	"array_num_int_1":           "Int64Array",
+	"array_num_int_2":           "Int64Array",
+	"array_num_float":           "Float64Array",
 	"array_str":                 "StringArray",
 	"array_str_int_1":           "StringArray",
 	"array_str_int_2":           "StringArray",
@@ -98,10 +110,18 @@ var jsonSchema = map[string]string{
 	"array_str_date_2":          "DateTimeArray",
 	"array_str_time_rfc3339":    "DateTimeArray",
 	"array_str_time_clickhouse": "DateTimeArray",
-	"array_obj":                 "StringArray",
+	"array_obj":                 "Object('json')Array",
+	"map_str_str":               "Object('json')",
+	"map_str_uint":              "Object('json')",
+	"map_str_int":               "Object('json')",
+	"map_str_float":             "Object('json')",
+	"map_str_bool":              "Object('json')",
+	"map_str_date":              "Object('json')",
+	"map_str_array":             "Object('json')",
+	"map_str_map":               "Object('json')",
 }
 
-var csvSample = []byte(`null,true,false,123,123.321,"escaped_""ws",123,123.321,2009-07-13,13/07/2009,2009-07-13T09:07:13Z,2009-07-13T09:07:13.123+08:00,2009-07-13 09:07:13,2009-07-13 09:07:13.123,"{""i"":[1,2,3],""f"":[1.1,2.2,3.3],""s"":[""aa"",""bb"",""cc""],""e"":[]}",[],[null],"[true,false]","[0,255,256,65535,65536,4294967295,4294967296,18446744073709551615,18446744073709551616]","[-9223372036854775808,-2147483649,-2147483648,-32769,-32768,-129,-128,0,127,128,32767,32768,2147483647,2147483648,9223372036854775807]","[4.940656458412465441765687928682213723651e-324,1.401298464324817070923729583289916131280e-45,0.0,3.40282346638528859811704183484516925440e+38,1.797693134862315708145274237317043567981e+308]","[""aa"",""bb"",""cc""]","[""0"",""255"",""256"",""65535"",""65536"",""4294967295"",""4294967296"",""18446744073709551615"",""18446744073709551616""]","[""-9223372036854775808"",""-2147483649"",""-2147483648"",""-32769"",""-32768"",""-129"",""-128"",""0"",""127"",""128"",""32767"",""32768"",""2147483647"",""2147483648"",""9223372036854775807""]","[""4.940656458412465441765687928682213723651e-324"",""1.401298464324817070923729583289916131280e-45"",""0.0"",""3.40282346638528859811704183484516925440e+38"",""1.797693134862315708145274237317043567981e+308""]","[""2009-07-13"",""2009-07-14"",""2009-07-15""]","[""13/07/2009"",""14/07/2009"",""15/07/2009""]","[""2009-07-13T09:07:13Z"",""2009-07-13T09:07:13+08:00"",""2009-07-13T09:07:13.123Z"",""2009-07-13T09:07:13.123+08:00""]","[""2009-07-13 09:07:13"",""2009-07-13 09:07:13.123""]","[{""i"":[1,2,3],""f"":[1.1,2.2,3.3]},{""s"":[""aa"",""bb"",""cc""],""e"":[]}]"`)
+var csvSample = []byte(`null,true,false,123,123.321,kube-state-metrics,"escaped_""ws",123,123.321,2009-07-13,13/07/2009,2009-07-13T09:07:13Z,2009-07-13T09:07:13.123+08:00,2009-07-13 09:07:13,2009-07-13 09:07:13.123,"{""i"":[1,2,3],""f"":[1.1,2.2,3.3],""s"":[""aa"",""bb"",""cc""],""e"":[]}",[],[null],"[true,false]","[0,255,256,65535,65536,4294967295,4294967296,18446744073709551615,18446744073709551616]","[-9223372036854775808,-2147483649,-2147483648,-32769,-32768,-129,-128,0,127,128,32767,32768,2147483647,2147483648,9223372036854775807]","[4.940656458412465441765687928682213723651e-324,1.401298464324817070923729583289916131280e-45,0.0,3.40282346638528859811704183484516925440e+38,1.797693134862315708145274237317043567981e+308]","[""aa"",""bb"",""cc""]","[""0"",""255"",""256"",""65535"",""65536"",""4294967295"",""4294967296"",""18446744073709551615"",""18446744073709551616""]","[""-9223372036854775808"",""-2147483649"",""-2147483648"",""-32769"",""-32768"",""-129"",""-128"",""0"",""127"",""128"",""32767"",""32768"",""2147483647"",""2147483648"",""9223372036854775807""]","[""4.940656458412465441765687928682213723651e-324"",""1.401298464324817070923729583289916131280e-45"",""0.0"",""3.40282346638528859811704183484516925440e+38"",""1.797693134862315708145274237317043567981e+308""]","[""2009-07-13"",""2009-07-14"",""2009-07-15""]","[""13/07/2009"",""14/07/2009"",""15/07/2009""]","[""2009-07-13T09:07:13Z"",""2009-07-13T09:07:13+08:00"",""2009-07-13T09:07:13.123Z"",""2009-07-13T09:07:13.123+08:00""]","[""2009-07-13 09:07:13"",""2009-07-13 09:07:13.123""]","[{""i"":[1,2,3],""f"":[1.1,2.2,3.3]},{""s"":[""aa"",""bb"",""cc""],""e"":[]}]"`)
 
 var csvSchema = []string{
 	"null",
@@ -109,6 +129,7 @@ var csvSchema = []string{
 	"bool_false",
 	"num_int",
 	"num_float",
+	"app.kubernetes.io/name",
 	"str",
 	"str_int",
 	"str_float",
@@ -167,6 +188,12 @@ type ArrayCase struct {
 	ExpVal interface{}
 }
 
+type MapCase struct {
+	field  string
+	typ    *model.TypeInfo
+	expVal interface{}
+}
+
 type DateTimeCase struct {
 	TS     string
 	ExpVal time.Time
@@ -220,21 +247,37 @@ func doTestSimple(t *testing.T, method string, testCases []SimpleCase) {
 		for j := range testCases {
 			var v interface{}
 			desc := fmt.Sprintf(`%s.%s("%s", %s)`, name, method, testCases[j].Field, strconv.FormatBool(testCases[j].Nullable))
-			if name == "csv" && (sliceContains([]string{"GetInt", "GetFloat", "GetDateTime", "GetElasticDateTime"}, method) && sliceContains([]string{"str_int", "str_float"}, testCases[j].Field) || testCases[j].Nullable) {
+			if (name == "csv" && (sliceContains([]string{"GetBool", "GetInt64", "GetFloat64", "GetDateTime"}, method) && sliceContains([]string{"str_int", "str_float"}, testCases[j].Field) || testCases[j].Nullable)) || (name == "gjson" && strings.Contains(testCases[j].Field, ".")) {
 				skipped = append(skipped, desc)
 				continue
 			}
 			switch method {
-			case "GetInt":
-				v = metric.GetInt(testCases[j].Field, testCases[j].Nullable)
-			case "GetFloat":
-				v = metric.GetFloat(testCases[j].Field, testCases[j].Nullable)
-			case "GetString":
-				v = metric.GetString(testCases[j].Field, testCases[j].Nullable)
+			case "GetBool":
+				v = metric.GetBool(testCases[j].Field, testCases[j].Nullable)
+			case "GetInt8":
+				v = metric.GetInt8(testCases[j].Field, testCases[j].Nullable)
+			case "GetInt16":
+				v = metric.GetInt16(testCases[j].Field, testCases[j].Nullable)
+			case "GetInt32":
+				v = metric.GetInt32(testCases[j].Field, testCases[j].Nullable)
+			case "GetInt64":
+				v = metric.GetInt64(testCases[j].Field, testCases[j].Nullable)
+			case "GetUint8":
+				v = metric.GetUint8(testCases[j].Field, testCases[j].Nullable)
+			case "GetUint16":
+				v = metric.GetUint16(testCases[j].Field, testCases[j].Nullable)
+			case "GetUint32":
+				v = metric.GetUint32(testCases[j].Field, testCases[j].Nullable)
+			case "GetUint64":
+				v = metric.GetUint64(testCases[j].Field, testCases[j].Nullable)
+			case "GetFloat32":
+				v = metric.GetFloat32(testCases[j].Field, testCases[j].Nullable)
+			case "GetFloat64":
+				v = metric.GetFloat64(testCases[j].Field, testCases[j].Nullable)
 			case "GetDateTime":
 				v = metric.GetDateTime(testCases[j].Field, testCases[j].Nullable)
-			case "GetElasticDateTime":
-				v = metric.GetElasticDateTime(testCases[j].Field, testCases[j].Nullable)
+			case "GetString":
+				v = metric.GetString(testCases[j].Field, testCases[j].Nullable)
 			default:
 				panic("error!")
 			}
@@ -244,6 +287,38 @@ func doTestSimple(t *testing.T, method string, testCases []SimpleCase) {
 			log.Printf("Skipped %d cases incompatible with fastjson parser: %v\n", len(skipped), strings.Join(skipped, ", "))
 		}
 	}
+}
+
+func TestParserBool(t *testing.T) {
+	testCases := []SimpleCase{
+		// nullable: false
+		{"not_exist", false, false},
+		{"null", false, false},
+		{"bool_true", false, true},
+		{"bool_false", false, false},
+		{"num_int", false, false},
+		{"num_float", false, false},
+		{"str", false, false},
+		{"str_int", false, false},
+		{"str_float", false, false},
+		{"str_date_1", false, false},
+		{"obj", false, false},
+		{"array_empty", false, false},
+		// nullable: true
+		{"not_exist", true, nil},
+		{"null", true, nil},
+		{"bool_true", true, true},
+		{"bool_false", true, false},
+		{"num_int", true, nil},
+		{"num_float", true, nil},
+		{"str", true, nil},
+		{"str_int", true, nil},
+		{"str_float", true, nil},
+		{"str_date_1", true, nil},
+		{"obj", true, nil},
+		{"array_empty", true, nil},
+	}
+	doTestSimple(t, "GetBool", testCases)
 }
 
 func TestParserInt(t *testing.T) {
@@ -275,7 +350,7 @@ func TestParserInt(t *testing.T) {
 		{"obj", true, nil},
 		{"array_empty", true, nil},
 	}
-	doTestSimple(t, "GetInt", testCases)
+	doTestSimple(t, "GetInt64", testCases)
 }
 
 func TestParserFloat(t *testing.T) {
@@ -307,7 +382,7 @@ func TestParserFloat(t *testing.T) {
 		{"obj", true, nil},
 		{"array_empty", true, nil},
 	}
-	doTestSimple(t, "GetFloat", testCases)
+	doTestSimple(t, "GetFloat64", testCases)
 }
 
 func TestParserString(t *testing.T) {
@@ -319,6 +394,7 @@ func TestParserString(t *testing.T) {
 		{"bool_false", false, "false"},
 		{"num_int", false, "123"},
 		{"num_float", false, "123.321"},
+		{"app.kubernetes.io/name", false, `kube-state-metrics`},
 		{"str", false, `escaped_"ws`},
 		{"str_int", false, "123"},
 		{"str_float", false, "123.321"},
@@ -335,6 +411,7 @@ func TestParserString(t *testing.T) {
 		{"bool_false", true, "false"},
 		{"num_int", true, "123"},
 		{"num_float", true, "123.321"},
+		{"app.kubernetes.io/name", true, `kube-state-metrics`},
 		{"str", true, `escaped_"ws`},
 		{"str_int", true, "123"},
 		{"str_float", true, "123.321"},
@@ -388,107 +465,77 @@ func TestParserDateTime(t *testing.T) {
 	doTestSimple(t, "GetDateTime", testCases)
 }
 
-func TestParserElasticDateTime(t *testing.T) {
-	testCases := []SimpleCase{
-		// nullable: false
-		{"not_exist", false, Epoch.Unix()},
-		{"null", false, Epoch.Unix()},
-		{"bool_true", false, Epoch.Unix()},
-		{"bool_false", false, Epoch.Unix()},
-		{"num_int", false, UnixFloat(123, timeUnit).Unix()},
-		{"num_float", false, UnixFloat(123.321, timeUnit).Unix()},
-		{"str", false, Epoch.Unix()},
-		{"str_int", false, Epoch.Unix()},
-		{"str_float", false, Epoch.Unix()},
-		{"str_date_1", false, bdLocalDate.Unix()},
-		{"str_time_rfc3339_1", false, bdUtcSec.Unix()},
-		{"str_time_rfc3339_2", false, bdShNs.Unix()},
-		{"str_time_clickhouse_1", false, bdLocalSec.Unix()},
-		{"str_time_clickhouse_2", false, bdLocalNs.Unix()},
-		{"obj", false, Epoch.Unix()},
-		{"array_empty", false, Epoch.Unix()},
-		// nullable: true
-		{"not_exist", true, nil},
-		{"null", true, nil},
-		{"bool_true", true, nil},
-		{"bool_false", true, nil},
-		{"num_int", true, UnixFloat(123, timeUnit).Unix()},
-		{"num_float", true, UnixFloat(123.321, timeUnit).Unix()},
-		{"str", true, nil},
-		{"str_int", true, nil},
-		{"str_float", true, nil},
-		{"str_date_1", true, bdLocalDate.Unix()},
-		{"str_time_rfc3339_1", true, bdUtcSec.Unix()},
-		{"str_time_rfc3339_2", true, bdShNs.Unix()},
-		{"str_time_clickhouse_1", true, bdLocalSec.Unix()},
-		{"str_time_clickhouse_2", true, bdLocalNs.Unix()},
-		{"obj", true, nil},
-		{"array_empty", true, nil},
-	}
-	doTestSimple(t, "GetElasticDateTime", testCases)
-}
-
 func TestParserArray(t *testing.T) {
 	initialize.Do(initMetrics)
 	require.Nil(t, errInit)
 
 	testCases := []ArrayCase{
-		{"not_exist", model.Float, []float64{}},
-		{"null", model.Float, []float64{}},
-		{"num_int", model.Int, []int64{}},
-		{"num_float", model.Float, []float64{}},
+		{"not_exist", model.Float64, []float64{}},
+		{"null", model.Float64, []float64{}},
+		{"num_int", model.Int64, []int64{}},
+		{"num_float", model.Float64, []float64{}},
 		{"str", model.String, []string{}},
 		{"str_int", model.String, []string{}},
 		{"str_date_1", model.DateTime, []time.Time{}},
 		{"obj", model.String, []string{}},
 
-		{"array_empty", model.Int, []int64{}},
-		{"array_empty", model.Float, []float64{}},
+		{"array_empty", model.Bool, []bool{}},
+		{"array_empty", model.Int64, []int64{}},
+		{"array_empty", model.Float64, []float64{}},
 		{"array_empty", model.String, []string{}},
 		{"array_empty", model.DateTime, []time.Time{}},
 
-		{"array_null", model.Int, []int64{0}},
-		{"array_null", model.Float, []float64{0.0}},
+		{"array_null", model.Bool, []bool{false}},
+		{"array_null", model.Int64, []int64{0}},
+		{"array_null", model.Float64, []float64{0.0}},
 		{"array_null", model.String, []string{""}},
 		{"array_null", model.DateTime, []time.Time{Epoch}},
 
-		{"array_bool", model.Int, []int64{1, 0}},
-		{"array_bool", model.Float, []float64{0.0, 0.0}},
+		{"array_bool", model.Bool, []bool{true, false}},
+		{"array_bool", model.Int64, []int64{1, 0}},
+		{"array_bool", model.Float64, []float64{0.0, 0.0}},
 		{"array_bool", model.String, []string{"true", "false"}},
 		{"array_bool", model.DateTime, []time.Time{Epoch, Epoch}},
 
-		{"array_num_int_1", model.Int, []int64{0, 255, 256, 65535, 65536, 4294967295, 4294967296, 0, 0}},
-		{"array_num_int_1", model.Float, []float64{0, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615, 18446744073709551616}},
+		{"array_num_int_1", model.Bool, []bool{false, false, false, false, false, false, false, false, false}},
+		{"array_num_int_1", model.Int64, []int64{0, 255, 256, 65535, 65536, 4294967295, 4294967296, 0, 0}},
+		{"array_num_int_1", model.Float64, []float64{0, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615, 18446744073709551616}},
 		{"array_num_int_1", model.String, []string{"0", "255", "256", "65535", "65536", "4294967295", "4294967296", "18446744073709551615", "18446744073709551616"}},
 		{"array_num_int_1", model.DateTime, []time.Time{Epoch, UnixFloat(255, timeUnit), UnixFloat(256, timeUnit), UnixFloat(65535, timeUnit), UnixFloat(65536, timeUnit), UnixFloat(4294967295, timeUnit), UnixFloat(4294967296, timeUnit), Epoch, Epoch}},
 
-		{"array_num_int_2", model.Int, []int64{-9223372036854775808, -2147483649, -2147483648, -32769, -32768, -129, -128, 0, 127, 128, 32767, 32768, 2147483647, 2147483648, 9223372036854775807}},
-		{"array_num_int_2", model.Float, []float64{-9223372036854775808, -2147483649, -2147483648, -32769, -32768, -129, -128, 0, 127, 128, 32767, 32768, 2147483647, 2147483648, 9223372036854775807}},
+		{"array_num_int_2", model.Bool, []bool{false, false, false, false, false, false, false, false, false, false, false, false, false, false, false}},
+		{"array_num_int_2", model.Int64, []int64{-9223372036854775808, -2147483649, -2147483648, -32769, -32768, -129, -128, 0, 127, 128, 32767, 32768, 2147483647, 2147483648, 9223372036854775807}},
+		{"array_num_int_2", model.Float64, []float64{-9223372036854775808, -2147483649, -2147483648, -32769, -32768, -129, -128, 0, 127, 128, 32767, 32768, 2147483647, 2147483648, 9223372036854775807}},
 		{"array_num_int_2", model.String, []string{"-9223372036854775808", "-2147483649", "-2147483648", "-32769", "-32768", "-129", "-128", "0", "127", "128", "32767", "32768", "2147483647", "2147483648", "9223372036854775807"}},
 		{"array_num_int_2", model.DateTime, []time.Time{Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, UnixFloat(127, timeUnit), UnixFloat(128, timeUnit), UnixFloat(32767, timeUnit), UnixFloat(32768, timeUnit), UnixFloat(2147483647, timeUnit), UnixFloat(2147483648, timeUnit), UnixFloat(9223372036854775807, timeUnit)}},
 
-		{"array_num_float", model.Int, []int64{0, 0, 0, 0, 0, 0, 0}},
-		{"array_num_float", model.Float, []float64{4.940656458412465441765687928682213723651e-324, 1.401298464324817070923729583289916131280e-45, 0.0, 3.40282346638528859811704183484516925440e+38, 1.797693134862315708145274237317043567981e+308, math.Inf(-1), math.Inf(1)}},
+		{"array_num_float", model.Bool, []bool{false, false, false, false, false, false, false}},
+		{"array_num_float", model.Int64, []int64{0, 0, 0, 0, 0, 0, 0}},
+		{"array_num_float", model.Float64, []float64{4.940656458412465441765687928682213723651e-324, 1.401298464324817070923729583289916131280e-45, 0.0, 3.40282346638528859811704183484516925440e+38, 1.797693134862315708145274237317043567981e+308, math.Inf(-1), math.MaxFloat64}},
 		{"array_num_float", model.String, []string{"4.940656458412465441765687928682213723651e-324", "1.401298464324817070923729583289916131280e-45", "0.0", "3.40282346638528859811704183484516925440e+38", "1.797693134862315708145274237317043567981e+308", "-inf", "+inf"}},
 		{"array_num_float", model.DateTime, []time.Time{Epoch, Epoch, Epoch, UnixFloat(3.40282346638528859811704183484516925440e+38, timeUnit), UnixFloat(1.797693134862315708145274237317043567981e+308, timeUnit), UnixFloat(math.Inf(-1), timeUnit), UnixFloat(math.Inf(1), timeUnit)}},
 
-		{"array_str", model.Int, []int64{0, 0, 0}},
-		{"array_str", model.Float, []float64{0.0, 0.0, 0.0}},
+		{"array_str", model.Bool, []bool{false, false, false}},
+		{"array_str", model.Int64, []int64{0, 0, 0}},
+		{"array_str", model.Float64, []float64{0.0, 0.0, 0.0}},
 		{"array_str", model.String, []string{"aa", "bb", "cc"}},
 		{"array_str", model.DateTime, []time.Time{Epoch, Epoch, Epoch}},
 
-		{"array_str_int_1", model.Int, []int64{0, 0, 0, 0, 0, 0, 0, 0, 0}},
-		{"array_str_int_1", model.Float, []float64{0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{"array_str_int_1", model.Bool, []bool{false, false, false, false, false, false, false, false, false}},
+		{"array_str_int_1", model.Int64, []int64{0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{"array_str_int_1", model.Float64, []float64{0, 0, 0, 0, 0, 0, 0, 0, 0}},
 		{"array_str_int_1", model.String, []string{"0", "255", "256", "65535", "65536", "4294967295", "4294967296", "18446744073709551615", "18446744073709551616"}},
 		{"array_str_int_1", model.DateTime, []time.Time{Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch}},
 
-		{"array_str_int_2", model.Int, []int64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-		{"array_str_int_2", model.Float, []float64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{"array_str_int_2", model.Bool, []bool{false, false, false, false, false, false, false, false, false, false, false, false, false, false, false}},
+		{"array_str_int_2", model.Int64, []int64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{"array_str_int_2", model.Float64, []float64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
 		{"array_str_int_2", model.String, []string{"-9223372036854775808", "-2147483649", "-2147483648", "-32769", "-32768", "-129", "-128", "0", "127", "128", "32767", "32768", "2147483647", "2147483648", "9223372036854775807"}},
 		{"array_str_int_2", model.DateTime, []time.Time{Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch}},
 
-		{"array_str_float", model.Int, []int64{0, 0, 0, 0, 0, 0, 0}},
-		{"array_str_float", model.Float, []float64{0, 0, 0, 0, 0, 0, 0}},
+		{"array_str_float", model.Bool, []bool{false, false, false, false, false, false, false}},
+		{"array_str_float", model.Int64, []int64{0, 0, 0, 0, 0, 0, 0}},
+		{"array_str_float", model.Float64, []float64{0, 0, 0, 0, 0, 0, 0}},
 		{"array_str_float", model.String, []string{"4.940656458412465441765687928682213723651e-324", "1.401298464324817070923729583289916131280e-45", "0.0", "3.40282346638528859811704183484516925440e+38", "1.797693134862315708145274237317043567981e+308", "-inf", "+inf"}},
 		{"array_str_float", model.DateTime, []time.Time{Epoch, Epoch, Epoch, Epoch, Epoch, Epoch, Epoch}},
 
@@ -516,6 +563,90 @@ func TestParserArray(t *testing.T) {
 		if skipped != nil {
 			log.Printf("Skipped %d cases incompatible with fastjson parser: %v\n", len(skipped), strings.Join(skipped, ", "))
 		}
+	}
+}
+
+func TestParserMap(t *testing.T) {
+	initialize.Do(initMetrics)
+	require.Nil(t, errInit)
+
+	testCases := []MapCase{
+		{"map_str_str", &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.String}}, map[string]string{"i": "first", "j": "second"}},
+		{"map_str_uint", &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.UInt64}}, map[string]uint64{"i": 1, "j": 2}},
+		{"map_str_int", &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.Int64}}, map[string]int64{"i": -1, "j": -2}},
+		{"map_str_float", &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.Float64}}, map[string]float64{"i": 3.1415, "j": 9.876}},
+		{"map_str_bool", &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.Bool}}, map[string]bool{"i": true, "j": false}},
+		{"map_str_date", &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.DateTime}}, map[string]time.Time{"i": time.Date(2008, 8, 8, 0, 0, 0, 0, time.Local).UTC(), "j": time.Date(2022, 1, 1, 0, 0, 0, 0, time.Local).UTC()}},
+		{"map_str_array", &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.UInt64, Array: true}}, map[string][]uint64{"i": {1, 2, 3}, "j": {4, 5, 6}}},
+		{"map_str_map", &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.Map, MapKey: &model.TypeInfo{Type: model.String}, MapValue: &model.TypeInfo{Type: model.UInt64}}}, map[string]map[string]uint64{"i": {"i": 1, "j": 2}, "j": {"i": 3, "j": 4}}},
+	}
+	for _, name := range []string{"fastjson", "gjson"} {
+		metric := metrics[name]
+		for _, it := range testCases {
+			desc := fmt.Sprintf(`%s.GetMap("%s", %s)`, name, it.field, model.GetTypeName(it.typ.Type))
+
+			orderMap := metric.GetMap(it.field, it.typ)
+			compareMap(t, orderMap, it.expVal, desc)
+		}
+	}
+}
+
+func compareMap(t *testing.T, map1 interface{}, map2 interface{}, desc string) {
+	oMap, ok := map1.(*model.OrderedMap)
+	assert.True(t, ok, desc)
+	map1 = oMap.GetValues()
+
+	value1 := reflect.ValueOf(map1)
+	value2 := reflect.ValueOf(map2)
+	assert.Equal(t, value1.IsNil(), value2.IsNil())
+	assert.Equal(t, value1.Len(), value2.Len())
+
+	if value1.Kind() == reflect.Ptr {
+		value1 = value1.Elem()
+		value2 = value2.Elem()
+	}
+	assert.Equal(t, value1.Kind(), reflect.Map, fmt.Sprintf("ToMap only accepts struct or struct pointer; got %T", value1))
+	assert.Equal(t, value2.Kind(), reflect.Map, fmt.Sprintf("ToMap only accepts struct or struct pointer; got %T", value2))
+
+	// v1 - map[interface{}]interface{}, v2 could be any map type
+	var compareValueFunc func(v1, v2 reflect.Value) = func(v1, v2 reflect.Value) {
+		switch v2.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			assert.Equal(t, v1.Interface().(int64), v2.Int())
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			assert.Equal(t, v1.Interface().(uint64), v2.Uint())
+		case reflect.String:
+			assert.Equal(t, v1.Interface().(string), v2.String())
+		case reflect.Bool:
+			assert.Equal(t, v1.Interface().(bool), v2.Bool())
+		case reflect.Float32, reflect.Float64:
+			assert.Equal(t, v1.Interface().(float64), v2.Float())
+		case reflect.Map:
+			compareMap(t, v1.Interface(), v2.Interface(), desc)
+		case reflect.Array:
+			fallthrough
+		case reflect.Slice:
+			if v2.Len() == 0 {
+				return
+			}
+			// didn't find a good way to convert interface{} to []Type
+			switch v2.Index(0).Kind() {
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+				array1 := v1.Interface().([]uint64)
+				assert.Equal(t, len(array1), v2.Len())
+				for i := 0; i < v2.Len(); i++ {
+					assert.Equal(t, array1[i], v2.Index(i).Uint())
+				}
+			default:
+				assert.Fail(t, "uncovered array type comparison, update compareValueFunc accordingly")
+			}
+		default:
+			// Normal equality suffices
+			assert.Equal(t, v1.Interface(), v2.Interface())
+		}
+	}
+	for _, key := range value2.MapKeys() {
+		compareValueFunc(value1.MapIndex(key), value2.MapIndex(key))
 	}
 }
 
@@ -675,8 +806,13 @@ func TestFastjsonDetectSchema(t *testing.T) {
 	if obj, err = c.value.Object(); err != nil {
 		return
 	}
-	obj.Visit(func(key []byte, v *fastjson.Value) {
-		act[string(key)] = model.GetTypeName(fjDetectType(v))
+	obj.Visit(func(k []byte, v *fastjson.Value) {
+		typ, array := fjDetectType(v, 0)
+		tn := model.GetTypeName(typ)
+		if typ != model.Unknown && array {
+			tn += "Array"
+		}
+		act[string(k)] = tn
 	})
 	require.Equal(t, jsonSchema, act)
 }
@@ -691,7 +827,12 @@ func TestGjsonDetectSchema(t *testing.T) {
 	c, _ := metric.(*GjsonMetric)
 	obj := gjson.Parse(c.raw)
 	obj.ForEach(func(k, v gjson.Result) bool {
-		act[k.Str] = model.GetTypeName(gjDetectType(v))
+		typ, array := gjDetectType(v, 0)
+		tn := model.GetTypeName(typ)
+		if typ != model.Unknown && array {
+			tn += "Array"
+		}
+		act[k.Str] = tn
 		return true
 	})
 	require.Equal(t, jsonSchema, act)

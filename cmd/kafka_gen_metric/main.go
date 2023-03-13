@@ -26,7 +26,7 @@ CREATE TABLE sensor_dt_result_online ON CLUSTER abc (
 	is_missing Int32
 ) ENGINE=ReplicatedMergeTree('/clickhouse/tables/{cluster}/{database}/{table}/{shard}', '{replica}')
 PARTITION BY toYYYYMMDD(`@time`)
-ORDER BY (`@time`, `@ItemGUID`, `@MetricName`);
+ORDER BY (`@ItemGUID`, `@MetricName`, `@time`);
 
 CREATE TABLE dist_sensor_dt_result_online ON CLUSTER abc AS sensor_dt_result_online ENGINE = Distributed(abc, default, sensor_dt_result_online);
 
@@ -44,10 +44,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Shopify/sarama"
 	"github.com/google/gops/agent"
 	"github.com/housepower/clickhouse_sinker/util"
-	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/errors"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.uber.org/zap"
 )
 
@@ -113,21 +113,31 @@ func generate() {
 	rounded := time.Date(toRound.Year(), toRound.Month(), toRound.Day(), 0, 0, 0, 0, toRound.Location())
 
 	wp := util.NewWorkerPool(10, 10000)
-	config := sarama.NewConfig()
-	config.Version = sarama.V2_1_0_0
-	w, err := sarama.NewAsyncProducer(strings.Split(KafkaBrokers, ","), config)
-	if err != nil {
-		util.Logger.Error("sarama.NewAsyncProducer failed", zap.Error(err))
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(strings.Split(KafkaBrokers, ",")...),
 	}
-	defer w.Close()
-	chInput := w.Input()
+	var err error
+	var cl *kgo.Client
+	if cl, err = kgo.NewClient(opts...); err != nil {
+		util.Logger.Fatal("kgo.NewClient failed", zap.Error(err))
+	}
+	defer cl.Close()
+
+	ctx := context.Background()
+	produceCb := func(rec *kgo.Record, err error) {
+		if err != nil {
+			util.Logger.Fatal("kgo.Client.Produce failed", zap.Error(err))
+		}
+		atomic.AddInt64(&gLines, int64(1))
+		atomic.AddInt64(&gSize, int64(len(rec.Value)))
+	}
 
 	for day := 0; ; day++ {
 		tsDay := rounded.Add(time.Duration(24*day) * time.Hour)
 		for step := 0; step < 24*60*60; step++ {
+			timestamp := tsDay.Add(time.Duration(step) * time.Second)
 			for bus := 0; bus < BusinessNum; bus++ {
 				for ins := 0; ins < InstanceNum; ins++ {
-					timestamp := tsDay.Add(time.Duration(step) * time.Second)
 					metric := Metric{
 						Time:         timestamp,
 						ItemGUID:     fmt.Sprintf("bus%03d_ins%03d", bus, ins),
@@ -150,22 +160,20 @@ func generate() {
 						ShiftTag:     int32(rand.Intn(65535)),
 						SeasonTag:    int32(rand.Intn(65535)),
 						SpikeTag:     int32(rand.Intn(65535)),
-						IsMissing:    int32(rand.Intn(1)),
+						IsMissing:    int32(rand.Intn(2)),
 					}
 
 					_ = wp.Submit(func() {
 						var b []byte
-						if b, err = util.JsonMarshal(&metric); err != nil {
+						if b, err = JSONMarshal(&metric); err != nil {
 							err = errors.Wrapf(err, "")
 							util.Logger.Fatal("got error", zap.Error(err))
 						}
-						chInput <- &sarama.ProducerMessage{
+						cl.Produce(ctx, &kgo.Record{
 							Topic: KafkaTopic,
-							Key:   sarama.StringEncoder(metric.ItemGUID),
-							Value: sarama.ByteEncoder(b),
-						}
-						atomic.AddInt64(&gLines, int64(1))
-						atomic.AddInt64(&gSize, int64(len(b)))
+							Key:   []byte(metric.ItemGUID),
+							Value: b,
+						}, produceCb)
 					})
 				}
 			}
@@ -179,7 +187,7 @@ func main() {
 		usage := fmt.Sprintf(`Usage of %s
     %s kakfa_brokers topic
 This util fill some fields with random content, serialize and send to kafka.
-kakfa_brokers: for example, 192.168.102.114:9092,192.168.102.115:9092
+kakfa_brokers: for example, 192.168.110.8:9092,192.168.110.12:9092,192.168.110.16:9092
 topic: for example, sensor_dt_result_online`, os.Args[0], os.Args[0])
 		util.Logger.Info(usage)
 		os.Exit(0)

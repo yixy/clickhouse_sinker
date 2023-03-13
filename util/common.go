@@ -20,7 +20,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -37,7 +36,7 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 
 	"github.com/fagongzi/goetty"
-	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/errors"
 )
 
 var (
@@ -103,8 +102,12 @@ func StringContains(arr []string, str string) bool {
 }
 
 // GetSourceName returns the field name in message for the given ClickHouse column
-func GetSourceName(name string) (sourcename string) {
-	sourcename = strings.Replace(name, ".", "\\.", -1)
+func GetSourceName(parser, name string) (sourcename string) {
+	if parser == "gjson" {
+		sourcename = strings.Replace(name, ".", "\\.", -1)
+	} else {
+		sourcename = name
+	}
 	return
 }
 
@@ -116,7 +119,7 @@ func GetShift(s int) (shift uint) {
 }
 
 // GetOutboundIP get preferred outbound ip of this machine
-//https://stackoverflow.com/questions/23558425/how-do-i-get-the-local-ip-address-in-go
+// https://stackoverflow.com/questions/23558425/how-do-i-get-the-local-ip-address-in-go
 func GetOutboundIP() (ip net.IP, err error) {
 	var conn net.Conn
 	if conn, err = net.Dial("udp", "8.8.8.8:80"); err != nil {
@@ -170,17 +173,19 @@ func NewTLSConfig(caCertFiles, clientCertFile, clientKeyFile string, insecureSki
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
-	// Load CA cert
-	caCertPool := x509.NewCertPool()
-	for _, caCertFile := range strings.Split(caCertFiles, ",") {
-		caCert, err := ioutil.ReadFile(caCertFile)
-		if err != nil {
-			err = errors.Wrapf(err, "")
-			return &tlsConfig, err
+	// Load CA cert if it exists.  Not needed for OS trusted certs
+	if caCertFiles != "" {
+		caCertPool := x509.NewCertPool()
+		for _, caCertFile := range strings.Split(caCertFiles, ",") {
+			caCert, err := os.ReadFile(caCertFile)
+			if err != nil {
+				err = errors.Wrapf(err, "")
+				return &tlsConfig, err
+			}
+			caCertPool.AppendCertsFromPEM(caCert)
 		}
-		caCertPool.AppendCertsFromPEM(caCert)
+		tlsConfig.RootCAs = caCertPool
 	}
-	tlsConfig.RootCAs = caCertPool
 	tlsConfig.InsecureSkipVerify = insecureSkipVerify
 	return &tlsConfig, nil
 }

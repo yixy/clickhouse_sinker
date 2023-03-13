@@ -1,10 +1,11 @@
-/*Copyright [2019] housepower
+/*
+Copyright [2019] housepower
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-   http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,6 +19,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"sync"
@@ -25,9 +27,11 @@ import (
 
 	"github.com/housepower/clickhouse_sinker/model"
 	"github.com/housepower/clickhouse_sinker/util"
-	"github.com/pkg/errors"
+	"github.com/shopspring/decimal"
+	"github.com/thanos-io/thanos/pkg/errors"
 	"github.com/tidwall/gjson"
 	"github.com/valyala/fastjson/fastfloat"
+	"golang.org/x/exp/constraints"
 )
 
 var _ Parser = (*CsvParser)(nil)
@@ -46,11 +50,11 @@ func (p *CsvParser) Parse(bs []byte) (metric model.Metric, err error) {
 	}
 	var value []string
 	if value, err = r.Read(); err != nil {
-		err = errors.Wrap(err, "")
+		err = errors.Wrapf(err, "")
 		return
 	}
 	if len(value) != len(p.pp.csvFormat) {
-		err = errors.Errorf("csv value doesn't match the format")
+		err = errors.Newf("csv value doesn't match the format")
 		return
 	}
 	metric = &CsvMetric{p.pp, value}
@@ -78,8 +82,125 @@ func (c *CsvMetric) GetString(key string, nullable bool) (val interface{}) {
 	return
 }
 
+// GetDecimal returns the value as decimal
+func (c *CsvMetric) GetDecimal(key string, nullable bool) (val interface{}) {
+	var idx int
+	var ok bool
+	if idx, ok = c.pp.csvFormat[key]; !ok || c.values[idx] == "null" {
+		if nullable {
+			return
+		}
+		val = decimal.NewFromInt(0)
+		return
+	}
+	val, _ = decimal.NewFromString(c.values[idx])
+	return
+}
+
+func (c *CsvMetric) GetBool(key string, nullable bool) (val interface{}) {
+	var idx int
+	var ok bool
+	if idx, ok = c.pp.csvFormat[key]; !ok || c.values[idx] == "" || c.values[idx] == "null" {
+		if nullable {
+			return
+		}
+		val = false
+		return
+	}
+	val = (c.values[idx] == "true")
+	return
+}
+
+func (c *CsvMetric) GetInt8(key string, nullable bool) (val interface{}) {
+	return CsvGetInt[int8](c, key, nullable, math.MinInt8, math.MaxInt8)
+}
+
+func (c *CsvMetric) GetInt16(key string, nullable bool) (val interface{}) {
+	return CsvGetInt[int16](c, key, nullable, math.MinInt16, math.MaxInt16)
+}
+
+func (c *CsvMetric) GetInt32(key string, nullable bool) (val interface{}) {
+	return CsvGetInt[int32](c, key, nullable, math.MinInt32, math.MaxInt32)
+}
+
+func (c *CsvMetric) GetInt64(key string, nullable bool) (val interface{}) {
+	return CsvGetInt[int64](c, key, nullable, math.MinInt64, math.MaxInt64)
+}
+
+func (c *CsvMetric) GetUint8(key string, nullable bool) (val interface{}) {
+	return CsvGetUint[uint8](c, key, nullable, math.MaxUint8)
+}
+
+func (c *CsvMetric) GetUint16(key string, nullable bool) (val interface{}) {
+	return CsvGetUint[uint16](c, key, nullable, math.MaxUint16)
+}
+
+func (c *CsvMetric) GetUint32(key string, nullable bool) (val interface{}) {
+	return CsvGetUint[uint32](c, key, nullable, math.MaxUint32)
+}
+
+func (c *CsvMetric) GetUint64(key string, nullable bool) (val interface{}) {
+	return CsvGetUint[uint64](c, key, nullable, math.MaxUint64)
+}
+
+func (c *CsvMetric) GetFloat32(key string, nullable bool) (val interface{}) {
+	return CsvGetFloat[float32](c, key, nullable, math.MaxFloat32)
+}
+
+func (c *CsvMetric) GetFloat64(key string, nullable bool) (val interface{}) {
+	return CsvGetFloat[float64](c, key, nullable, math.MaxFloat64)
+}
+
+func CsvGetInt[T constraints.Signed](c *CsvMetric, key string, nullable bool, min, max int64) (val interface{}) {
+	var idx int
+	var ok bool
+	if idx, ok = c.pp.csvFormat[key]; !ok || c.values[idx] == "null" {
+		if nullable {
+			return
+		}
+		val = T(0)
+		return
+	}
+	if s := c.values[idx]; s == "true" {
+		val = T(1)
+	} else {
+		val2 := fastfloat.ParseInt64BestEffort(s)
+		if val2 < min {
+			val = T(min)
+		} else if val2 > max {
+			val = T(max)
+		} else {
+			val = T(val2)
+		}
+	}
+	return
+}
+
+func CsvGetUint[T constraints.Unsigned](c *CsvMetric, key string, nullable bool, max uint64) (val interface{}) {
+	var idx int
+	var ok bool
+	if idx, ok = c.pp.csvFormat[key]; !ok || c.values[idx] == "null" {
+		if nullable {
+			return
+		}
+		val = T(0)
+		return
+	}
+	if s := c.values[idx]; s == "true" {
+		val = T(1)
+	} else {
+		val2 := fastfloat.ParseUint64BestEffort(s)
+		if val2 > max {
+			val = T(max)
+		} else {
+			val = T(val2)
+		}
+	}
+	return
+}
+
 // GetFloat returns the value as float
-func (c *CsvMetric) GetFloat(key string, nullable bool) (val interface{}) {
+func CsvGetFloat[T constraints.Float](c *CsvMetric, key string, nullable bool, max float64) (val interface{}) {
 	var idx int
 	var ok bool
 	if idx, ok = c.pp.csvFormat[key]; !ok || c.values[idx] == "null" {
@@ -89,25 +210,11 @@ func (c *CsvMetric) GetFloat(key string, nullable bool) (val interface{}) {
 		val = float64(0.0)
 		return
 	}
-	val = fastfloat.ParseBestEffort(c.values[idx])
-	return
-}
-
-// GetInt returns int
-func (c *CsvMetric) GetInt(key string, nullable bool) (val interface{}) {
-	var idx int
-	var ok bool
-	if idx, ok = c.pp.csvFormat[key]; !ok || c.values[idx] == "null" {
-		if nullable {
-			return
-		}
-		val = int64(0)
-		return
-	}
-	if s := c.values[idx]; s == "true" {
-		val = int64(1)
+	val2 := fastfloat.ParseBestEffort(c.values[idx])
+	if val2 > max {
+		val = T(max)
 	} else {
-		val = fastfloat.ParseInt64BestEffort(s)
+		val = T(val2)
 	}
 	return
 }
@@ -134,77 +241,75 @@ func (c *CsvMetric) GetDateTime(key string, nullable bool) (val interface{}) {
 	return
 }
 
-func (c *CsvMetric) GetElasticDateTime(key string, nullable bool) (val interface{}) {
-	t := c.GetDateTime(key, nullable)
-	if t != nil {
-		val = t.(time.Time).Unix()
-	}
-	return
-}
-
 // GetArray parse an CSV encoded array
 func (c *CsvMetric) GetArray(key string, typ int) (val interface{}) {
 	s := c.GetString(key, false)
 	str, _ := s.(string)
-	if str == "" || str[0] != '[' {
-		val = makeArray(typ)
-		return
-	}
-	array := gjson.Parse(str).Array()
-	if len(array) == 0 {
-		val = makeArray(typ)
-		return
+	var array []gjson.Result
+	r := gjson.Parse(str)
+	if r.IsArray() {
+		array = r.Array()
 	}
 	switch typ {
-	case model.Int:
-		results := make([]int64, 0, len(array))
+	case model.Bool:
+		results := make([]bool, 0, len(array))
 		for _, e := range array {
-			var v int64
-			switch e.Type {
-			case gjson.True:
-				v = int64(1)
-			case gjson.Number:
-				if v = e.Int(); float64(v) != e.Num {
-					v = int64(0)
-				}
-			default:
-				v = int64(0)
-			}
+			v := (e.Exists() && e.Type == gjson.True)
 			results = append(results, v)
 		}
 		val = results
-	case model.Float:
-		results := make([]float64, 0, len(array))
+	case model.Int8:
+		val = GjsonIntArray[int8](array, math.MinInt8, math.MaxInt8)
+	case model.Int16:
+		val = GjsonIntArray[int16](array, math.MinInt16, math.MaxInt16)
+	case model.Int32:
+		val = GjsonIntArray[int32](array, math.MinInt32, math.MaxInt32)
+	case model.Int64:
+		val = GjsonIntArray[int64](array, math.MinInt64, math.MaxInt64)
+	case model.UInt8:
+		val = GjsonUintArray[uint8](array, math.MaxUint8)
+	case model.UInt16:
+		val = GjsonUintArray[uint16](array, math.MaxUint16)
+	case model.UInt32:
+		val = GjsonUintArray[uint32](array, math.MaxUint32)
+	case model.UInt64:
+		val = GjsonUintArray[uint64](array, math.MaxUint64)
+	case model.Float32:
+		val = GjsonFloatArray[float32](array, math.MaxFloat32)
+	case model.Float64:
+		val = GjsonFloatArray[float64](array, math.MaxFloat64)
+	case model.Decimal:
+		results := make([]decimal.Decimal, 0, len(array))
+		var f float64
 		for _, e := range array {
-			var v float64
 			switch e.Type {
 			case gjson.Number:
-				v = e.Num
+				f = e.Num
 			default:
-				v = float64(0.0)
+				f = float64(0.0)
 			}
-			results = append(results, v)
+			results = append(results, decimal.NewFromFloat(f))
 		}
 		val = results
 	case model.String:
 		results := make([]string, 0, len(array))
+		var s string
 		for _, e := range array {
-			var v string
 			switch e.Type {
 			case gjson.Null:
-				v = ""
+				s = ""
 			case gjson.String:
-				v = e.Str
+				s = e.Str
 			default:
-				v = e.Raw
+				s = e.Raw
 			}
-			results = append(results, v)
+			results = append(results, s)
 		}
 		val = results
 	case model.DateTime:
 		results := make([]time.Time, 0, len(array))
+		var t time.Time
 		for _, e := range array {
-			var t time.Time
 			switch e.Type {
 			case gjson.Number:
 				t = UnixFloat(e.Num, c.pp.timeUnit)
@@ -225,6 +330,14 @@ func (c *CsvMetric) GetArray(key string, typ int) (val interface{}) {
 	return
 }
 
-func (c *CsvMetric) GetNewKeys(knownKeys, newKeys *sync.Map, white, black *regexp.Regexp) bool {
+func (c *CsvMetric) GetObject(key string, nullable bool) (val interface{}) {
+	return
+}
+
+func (c *CsvMetric) GetMap(key string, typeinfo *model.TypeInfo) (val interface{}) {
+	return
+}
+
+func (c *CsvMetric) GetNewKeys(knownKeys, newKeys, warnKeys *sync.Map, white, black *regexp.Regexp, partition int, offset int64) bool {
 	return false
 }

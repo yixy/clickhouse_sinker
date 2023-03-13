@@ -6,7 +6,7 @@ curl "localhost:8123" -d 'CREATE TABLE test_fixed_schema
 (
     time DateTime,
     name String,
-    value Float64,
+    value Float32,
     price Decimal32(3) DEFAULT(9.9)
 )
 ENGINE = MergeTree
@@ -29,7 +29,7 @@ for i in `seq 1 10000`;do
     echo "{\"time\" : \"${now}\", \"name\" : \"name$i\", \"value\" : $i, \"price\" : $price }"
 done > a.json
 for i in `seq 10001 30000`;do
-    echo "{\"time\" : \"${now}\", \"name\" : \"name$i\", \"value\" : $i, \"newkey01\" : $i }"
+    echo "{\"time\" : \"${now}\", \"name\" : \"name$i\", \"value\" : $i, \"newkey00\" : false, \"newkey01\" : $i }"
 done >> a.json
 for i in `seq 30001 50000`;do
     echo "{\"time\" : \"${now}\", \"name\" : \"name$i\", \"value\" : $i, \"newkey02\" : $i.123, \"newkey03\" : \"name$i\", \"newkey04\" : \"${now}\", \"newkey05\" : {\"k1\": 1, \"k2\": 2} }"
@@ -48,9 +48,9 @@ sudo docker cp send.sh kafka:/tmp/
 sudo docker exec kafka sh /tmp/send.sh
 
 echo "start clickhouse_sinker to consume"
-timeout 30 ./clickhouse_sinker --local-cfg-file docker/test_fixed_schema.json
-timeout 30 ./clickhouse_sinker --local-cfg-file docker/test_auto_schema.json
-timeout 60 ./clickhouse_sinker --local-cfg-file docker/test_dynamic_schema.json
+timeout 30 ./clickhouse_sinker --local-cfg-file docker/test_fixed_schema.hjson
+timeout 30 ./clickhouse_sinker --local-cfg-file docker/test_auto_schema.hjson
+timeout 60 ./clickhouse_sinker --local-cfg-file docker/test_dynamic_schema.hjson
 
 echo "check result 1"
 count=`curl "localhost:8123" -d 'select count() from test_fixed_schema'`
@@ -63,7 +63,7 @@ echo "Got test_auto_schema count => $count"
 
 schema=`curl "localhost:8123" -d 'DESC test_dynamic_schema' 2>/dev/null | grep newkey | sort | tr -d '\t' | tr '\n' ','`
 echo "Got test_dynamic_schema schema => $schema"
-[ $schema = "newkey01Nullable(Int64),newkey02Nullable(Float64),newkey03Nullable(String),newkey04Nullable(DateTime64(3)),newkey05Nullable(String),newkey06Array(Int64),newkey07Array(Float64),newkey08Array(String),newkey09Array(DateTime64(3)),newkey10Array(String)," ] || exit 1
+[ $schema = "newkey00Nullable(Bool),newkey01Nullable(Int64),newkey02Nullable(Float64),newkey03Nullable(String),newkey04Nullable(DateTime64(3))," ] || exit 1
 count=`curl "localhost:8123" -d 'SELECT count() FROM test_dynamic_schema'`
 echo "Got test_dynamic_schema count => $count"
 [ $count -eq 100000 ] || exit 1
@@ -74,9 +74,9 @@ curl "localhost:8123" -d 'TRUNCATE TABLE test_auto_schema'
 curl "localhost:8123" -d 'TRUNCATE TABLE test_dynamic_schema'
 
 echo "publish clickhouse_sinker config"
-./nacos_publish_config --nacos-addr 127.0.0.1:8848 --nacos-username nacos --nacos-password nacos  --nacos-dataid test_fixed_schema --local-cfg-file docker/test_fixed_schema.json
-./nacos_publish_config --nacos-addr 127.0.0.1:8848 --nacos-username nacos --nacos-password nacos  --nacos-dataid test_auto_schema --local-cfg-file docker/test_auto_schema.json
-./nacos_publish_config --nacos-addr 127.0.0.1:8848 --nacos-username nacos --nacos-password nacos  --nacos-dataid test_dynamic_schema --local-cfg-file docker/test_dynamic_schema.json
+./nacos_publish_config --nacos-addr 127.0.0.1:8848 --nacos-username nacos --nacos-password nacos  --nacos-dataid test_fixed_schema --local-cfg-file docker/test_fixed_schema.hjson
+./nacos_publish_config --nacos-addr 127.0.0.1:8848 --nacos-username nacos --nacos-password nacos  --nacos-dataid test_auto_schema --local-cfg-file docker/test_auto_schema.hjson
+./nacos_publish_config --nacos-addr 127.0.0.1:8848 --nacos-username nacos --nacos-password nacos  --nacos-dataid test_dynamic_schema --local-cfg-file docker/test_dynamic_schema.hjson
 
 echo "start clickhouse_sinker to consume"
 sudo docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9093 --execute --reset-offsets --group test_fixed_schema --all-topics --to-earliest

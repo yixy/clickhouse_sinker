@@ -16,14 +16,15 @@ limitations under the License.
 package config
 
 import (
-	"encoding/json"
-	"io/ioutil"
+	"os"
 	"regexp"
 	"strings"
 
+	"github.com/hjson/hjson-go/v4"
+
 	"github.com/housepower/clickhouse_sinker/util"
 
-	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/errors"
 )
 
 // Config struct used for different configurations use
@@ -49,7 +50,7 @@ type KafkaConfig struct {
 	Security map[string]string
 	TLS      struct {
 		Enable         bool
-		CaCertFiles    string // Required. It's the CA cert.pem with which Kafka brokers certs be signed.
+		CaCertFiles    string // CA cert.pem with which Kafka brokers certs be signed.  Leave empty for certificates trusted by the OS
 		ClientCertFile string // Required for client authentication. It's client cert.pem.
 		ClientKeyFile  string // Required if and only if ClientCertFile is present. It's client key.pem.
 
@@ -102,9 +103,10 @@ type ClickHouseConfig struct {
 
 	RetryTimes   int //<=0 means retry infinitely
 	MaxOpenConns int
+	DialTimeout  int // Connection dial timeout in seconds
 }
 
-// Task configuration parameters
+// TaskConfig parameters
 type TaskConfig struct {
 	Name string
 
@@ -143,6 +145,10 @@ type TaskConfig struct {
 	}
 	// PrometheusSchema expects each message is a Prometheus metric(timestamp, value, metric name and a list of labels).
 	PrometheusSchema bool
+	// fields match PromLabelsBlackList are not considered as labels. Requires PrometheusSchema be true.
+	PromLabelsBlackList string // the regexp of black list
+	// whether load series at startup
+	LoadSeriesAtStartup bool
 
 	// ShardingKey is the column name to which sharding against
 	ShardingKey string `json:"shardingKey,omitempty"`
@@ -171,27 +177,28 @@ const (
 	defaultLogLevel           = "info"
 	defaultKerberosConfigPath = "/etc/krb5.conf"
 	defaultMaxOpenConns       = 1
+	defaultDialTimeout        = 2
 )
 
 func ParseLocalCfgFile(cfgPath string) (cfg *Config, err error) {
 	cfg = &Config{}
 	var b []byte
-	b, err = ioutil.ReadFile(cfgPath)
+	b, err = os.ReadFile(cfgPath)
 	if err != nil {
 		err = errors.Wrapf(err, "")
 		return
 	}
-	if err = json.Unmarshal(b, cfg); err != nil {
+	if err = hjson.Unmarshal(b, cfg); err != nil {
 		err = errors.Wrapf(err, "")
 		return
 	}
 	return
 }
 
-// normallize and validate configuration
+// Normalize and validate configuration
 func (cfg *Config) Normallize() (err error) {
 	if len(cfg.Clickhouse.Hosts) == 0 || cfg.Kafka.Brokers == "" {
-		err = errors.Errorf("invalid configuration")
+		err = errors.Newf("invalid configuration")
 		return
 	}
 	if cfg.Kafka.Version == "" {
@@ -220,7 +227,7 @@ func (cfg *Config) Normallize() (err error) {
 		switch cfg.Kafka.Sasl.Mechanism {
 		case "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "GSSAPI":
 		default:
-			err = errors.Errorf("kafka SASL mechanism %s is unsupported", cfg.Kafka.Sasl.Mechanism)
+			err = errors.Newf("kafka SASL mechanism %s is unsupported", cfg.Kafka.Sasl.Mechanism)
 			return
 		}
 	}
@@ -229,6 +236,10 @@ func (cfg *Config) Normallize() (err error) {
 	}
 	if cfg.Clickhouse.MaxOpenConns <= 0 {
 		cfg.Clickhouse.MaxOpenConns = defaultMaxOpenConns
+	}
+
+	if cfg.Clickhouse.DialTimeout <= 0 {
+		cfg.Clickhouse.DialTimeout = defaultDialTimeout
 	}
 
 	if cfg.Task != nil {
@@ -261,7 +272,7 @@ func (cfg *Config) normallizeTask(taskCfg *TaskConfig) (err error) {
 
 	for i := range taskCfg.Dims {
 		if taskCfg.Dims[i].SourceName == "" {
-			taskCfg.Dims[i].SourceName = util.GetSourceName(taskCfg.Dims[i].Name)
+			taskCfg.Dims[i].SourceName = util.GetSourceName(taskCfg.Parser, taskCfg.Dims[i].Name)
 		}
 	}
 
@@ -286,10 +297,12 @@ func (cfg *Config) normallizeTask(taskCfg *TaskConfig) (err error) {
 	if taskCfg.PrometheusSchema {
 		taskCfg.DynamicSchema.Enable = true
 		taskCfg.AutoSchema = true
+	} else {
+		taskCfg.PromLabelsBlackList = ""
 	}
 	if taskCfg.DynamicSchema.Enable {
 		if taskCfg.Parser != "fastjson" && taskCfg.Parser != "gjson" {
-			err = errors.Errorf("Parser %s doesn't support DynamicSchema", taskCfg.Parser)
+			err = errors.Newf("Parser %s doesn't support DynamicSchema", taskCfg.Parser)
 			return
 		}
 		if cfg.Clickhouse.Cluster == "" {
@@ -298,10 +311,13 @@ func (cfg *Config) normallizeTask(taskCfg *TaskConfig) (err error) {
 				numHosts += len(shard)
 			}
 			if numHosts > 1 {
-				err = errors.Errorf("Need to set cluster name when DynamicSchema is enabled and number of hosts is more than one")
+				err = errors.Newf("Need to set cluster name when DynamicSchema is enabled and number of hosts is more than one")
 				return
 			}
 		}
+	} else {
+		taskCfg.DynamicSchema.WhiteList = ""
+		taskCfg.DynamicSchema.BlackList = ""
 	}
 	if taskCfg.DynamicSchema.WhiteList != "" {
 		if _, err = regexp.Compile(taskCfg.DynamicSchema.WhiteList); err != nil {
@@ -315,10 +331,16 @@ func (cfg *Config) normallizeTask(taskCfg *TaskConfig) (err error) {
 			return
 		}
 	}
+	if taskCfg.PromLabelsBlackList != "" {
+		if _, err = regexp.Compile(taskCfg.PromLabelsBlackList); err != nil {
+			err = errors.Wrapf(err, "PromLabelsBlackList %s is invalid regexp", taskCfg.PromLabelsBlackList)
+			return
+		}
+	}
 	return
 }
 
-//convert java client style configuration into sinker
+// convert java client style configuration into sinker
 func (cfg *Config) convertKfkSecurity() {
 	if protocol, ok := cfg.Kafka.Security["security.protocol"]; ok {
 		if strings.Contains(protocol, "SASL") {

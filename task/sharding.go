@@ -11,7 +11,8 @@ import (
 	"github.com/housepower/clickhouse_sinker/pool"
 	"github.com/housepower/clickhouse_sinker/statistics"
 	"github.com/housepower/clickhouse_sinker/util"
-	"github.com/pkg/errors"
+	"github.com/shopspring/decimal"
+	"github.com/thanos-io/thanos/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -26,9 +27,13 @@ func NewShardingPolicy(shardingKey string, shardingStripe uint64, dims []*model.
 	colSeq := -1
 	for i, dim := range dims {
 		if dim.Name == shardingKey {
+			if dim.Type.Nullable || dim.Type.Array {
+				err = errors.Newf("invalid shardingKey %s, expect its type be numerical or string", shardingKey)
+				return
+			}
 			colSeq = i
-			switch dim.Type {
-			case model.Int, model.Float, model.DateTime, model.ElasticDateTime:
+			switch dim.Type.Type {
+			case model.Int8, model.Int16, model.Int32, model.Int64, model.UInt8, model.UInt16, model.UInt32, model.UInt64, model.Float32, model.Float64, model.Decimal, model.DateTime:
 				//numerical
 				if policy.stripe <= 0 {
 					policy.stripe = uint64(1)
@@ -37,13 +42,13 @@ func NewShardingPolicy(shardingKey string, shardingStripe uint64, dims []*model.
 				//string
 				policy.stripe = 0
 			default:
-				err = errors.Errorf("invalid shardingKey %s, expect its type be numerical or string", shardingKey)
+				err = errors.Newf("invalid shardingKey %s, expect its type be numerical or string", shardingKey)
 				return
 			}
 		}
 	}
 	if colSeq < 0 {
-		err = errors.Errorf("invalid shardingKey %s, no such column", shardingKey)
+		err = errors.Newf("invalid shardingKey %s, no such column", shardingKey)
 		return
 	}
 	policy.colSeq = colSeq
@@ -79,10 +84,12 @@ func (policy *ShardingPolicy) Calc(row *model.Row) (shard int, err error) {
 			valu64 = uint64(v)
 		case float64:
 			valu64 = uint64(v)
+		case decimal.Decimal:
+			valu64 = uint64(v.IntPart())
 		case time.Time:
 			valu64 = uint64(v.Unix())
 		default:
-			err = errors.Errorf("failed to convert %+v to integer", v)
+			err = errors.Newf("failed to convert %+v to integer", v)
 			return
 		}
 		shard = int((valu64 / policy.stripe) % uint64(policy.shards))
@@ -94,7 +101,7 @@ func (policy *ShardingPolicy) Calc(row *model.Row) (shard int, err error) {
 		case string:
 			valu64 = xxhash.Sum64String(v)
 		default:
-			err = errors.Errorf("failed to convert %+v to string", v)
+			err = errors.Newf("failed to convert %+v to string", v)
 			return
 		}
 		shard = int(valu64 % uint64(policy.shards))
@@ -204,7 +211,7 @@ func (sh *Sharder) doFlush(_ interface{}) {
 		}
 	}
 	if msgCnt > 0 {
-		util.Logger.Debug(fmt.Sprintf("going to flush batch group for topic %v, offsets %+v, messages %d", taskCfg.Topic, sh.offsets, msgCnt), zap.String("task", taskCfg.Name))
+		util.Logger.Info(fmt.Sprintf("created a batch group for topic %v, offsets %+v, messages %d", taskCfg.Topic, sh.offsets, msgCnt), zap.String("task", taskCfg.Name))
 		sh.batchSys.CreateBatchGroupMulti(batches, sh.offsets)
 		sh.offsets = make(map[int]int64)
 		// ALL batches in a group shall be populated before sending any one to next stage.
@@ -220,7 +227,7 @@ func (sh *Sharder) doFlush(_ interface{}) {
 		if errors.Is(err, goetty.ErrSystemStopped) {
 			util.Logger.Info("Sharder.doFlush scheduling timer to a stopped timer wheel")
 		} else {
-			err = errors.Wrap(err, "")
+			err = errors.Wrapf(err, "")
 			util.Logger.Fatal("scheduling timer filed", zap.String("task", taskCfg.Name), zap.Error(err))
 		}
 	}

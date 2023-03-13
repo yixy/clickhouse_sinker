@@ -18,6 +18,7 @@ package input
 import (
 	"context"
 	"crypto/tls"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ import (
 	krb5client "github.com/jcmturner/gokrb5/v8/client"
 	krb5config "github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/keytab"
-	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/errors"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl"
 	"github.com/twmb/franz-go/pkg/sasl/kerberos"
@@ -41,6 +42,8 @@ import (
 
 const (
 	Krb5KeytabAuth = 2
+	CommitRetries  = 6
+	RetryBackoff   = 5 * time.Second
 )
 
 var _ Inputer = (*KafkaFranz)(nil)
@@ -71,23 +74,36 @@ func (k *KafkaFranz) Init(cfg *config.Config, taskCfg *config.TaskConfig, putFn 
 	k.putFn = putFn
 	k.cleanupFn = cleanupFn
 	kfkCfg := &cfg.Kafka
-
-	opts := []kgo.Opt{
-		kgo.SeedBrokers(strings.Split(kfkCfg.Brokers, ",")...),
+	var opts []kgo.Opt
+	if opts, err = GetFranzConfig(kfkCfg); err != nil {
+		return
+	}
+	opts = append(opts,
 		kgo.ConsumeTopics(taskCfg.Topic),
 		kgo.ConsumerGroup(taskCfg.ConsumerGroup),
 		kgo.DisableAutoCommit(),
-		kgo.OnPartitionsRevoked(k.onPartitionRevoked),
-		kgo.MaxConcurrentFetches(3),
-		kgo.FetchMaxBytes(1 << 27),      //134 MB
-		kgo.BrokerMaxReadBytes(1 << 27), //134 MB
+		kgo.OnPartitionsRevoked(k.onPartitionRevoked))
+	if !taskCfg.Earliest {
+		opts = append(opts, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
+	}
+
+	if k.cl, err = kgo.NewClient(opts...); err != nil {
+		err = errors.Wrapf(err, "")
+		return
+	}
+	return nil
+}
+
+func GetFranzConfig(kfkCfg *config.KafkaConfig) (opts []kgo.Opt, err error) {
+	opts = []kgo.Opt{
+		kgo.SeedBrokers(strings.Split(kfkCfg.Brokers, ",")...),
+		kgo.DisableAutoCommit(),
+		kgo.FetchMaxBytes(20971520), // 20 MB -- Larger numbers are likely to cause OOM.  Should be configurable
+		kgo.BrokerMaxReadBytes(20971520),
 		//kgo.MetadataMaxAge(...) corresponds to sarama.Config.Metadata.RefreshFrequency
 		kgo.WithLogger(kzap.New(util.Logger)),
 		//modify partition assignment
 		kgo.Balancers(kgo.RangeBalancer()),
-	}
-	if !taskCfg.Earliest {
-		opts = append(opts, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	}
 	if kfkCfg.TLS.Enable {
 		var tlsCfg *tls.Config
@@ -124,12 +140,12 @@ func (k *KafkaFranz) Init(cfg *config.Config, taskCfg *config.TaskConfig, putFn 
 			var krbCfg *krb5config.Config
 			var kt *keytab.Keytab
 			if krbCfg, err = krb5config.Load(gssapiCfg.KerberosConfigPath); err != nil {
-				err = errors.Wrap(err, "")
+				err = errors.Wrapf(err, "")
 				return
 			}
 			if gssapiCfg.AuthType == Krb5KeytabAuth {
 				if kt, err = keytab.Load(gssapiCfg.KeyTabPath); err != nil {
-					err = errors.Wrap(err, "")
+					err = errors.Wrapf(err, "")
 					return
 				}
 				auth.Client = krb5client.NewWithKeytab(gssapiCfg.Username, gssapiCfg.Realm, kt, krbCfg, krb5client.DisablePAFXFAST(gssapiCfg.DisablePAFXFAST))
@@ -137,19 +153,13 @@ func (k *KafkaFranz) Init(cfg *config.Config, taskCfg *config.TaskConfig, putFn 
 				auth.Client = krb5client.NewWithPassword(gssapiCfg.Username,
 					gssapiCfg.Realm, gssapiCfg.Password, krbCfg, krb5client.DisablePAFXFAST(gssapiCfg.DisablePAFXFAST))
 			}
-			mch = auth.AsMechanism()
+			mch = auth.AsMechanismWithClose()
 		}
 		if mch != nil {
 			opts = append(opts, kgo.SASL(mch))
 		}
 	}
-
-	if k.cl, err = kgo.NewClient(opts...); err != nil {
-		err = errors.Wrap(err, "")
-		return
-	}
-
-	return nil
+	return
 }
 
 // kafka main loop
@@ -157,19 +167,16 @@ func (k *KafkaFranz) Run() {
 	k.wgRun.Add(1)
 	defer k.wgRun.Done()
 	for {
-		fetches := k.cl.PollRecords(k.ctx, util.MaxPollRecords)
-		if fetches == nil || fetches.IsClientClosed() {
+		fetches := k.cl.PollFetches(k.ctx, util.MaxPollRecords)
+		err := fetches.Err()
+		if fetches == nil || fetches.IsClientClosed() || errors.Is(err, context.Canceled) {
 			break
 		}
-		var hasError bool
-		fetches.EachError(func(_ string, _ int32, err error) {
-			err = errors.Wrap(err, "")
-			util.Logger.Error("kgo.Client.PollFetchs() failed", zap.Error(err))
-			hasError = true
-		})
-		if hasError {
-			continue
+		if err != nil {
+			err = errors.Wrapf(err, "")
+			util.Logger.Info("kgo.Client.PollFetchs() got an error", zap.Error(err))
 		}
+		util.Logger.Debug("Records fetched", zap.String("task", k.taskCfg.Name), zap.String("records", strconv.Itoa(fetches.NumRecords())))
 		fetches.EachRecord(func(rec *kgo.Record) {
 			//do rate limit for reading kafka record
 			//Background returns a non-nil, empty Context. It is never canceled, has no values, and has no deadline.
@@ -197,7 +204,19 @@ func (k *KafkaFranz) Run() {
 
 func (k *KafkaFranz) CommitMessages(msg *model.InputMessage) error {
 	// "LeaderEpoch: -1" will disable leader epoch validation
-	return k.cl.CommitRecords(context.Background(), &kgo.Record{Topic: msg.Topic, Partition: int32(msg.Partition), Offset: msg.Offset, LeaderEpoch: -1})
+	var err error
+	for i := 0; i < CommitRetries; i++ {
+		err = k.cl.CommitRecords(context.Background(), &kgo.Record{Topic: msg.Topic, Partition: int32(msg.Partition), Offset: msg.Offset, LeaderEpoch: -1})
+		if err == nil {
+			break
+		}
+		err = errors.Wrapf(err, "")
+		if i < CommitRetries-1 && !errors.Is(err, context.Canceled) {
+			util.Logger.Error("cl.CommitRecords failed, will retry later", zap.String("task", k.taskCfg.Name), zap.Int("try", i), zap.Error(err))
+			time.Sleep(RetryBackoff)
+		}
+	}
+	return err
 }
 
 // Stop kafka consumer and close all connections

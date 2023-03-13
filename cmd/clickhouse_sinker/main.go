@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -40,7 +41,7 @@ import (
 	"github.com/housepower/clickhouse_sinker/util"
 	"go.uber.org/zap"
 
-	_ "github.com/ClickHouse/clickhouse-go"
+	_ "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -84,7 +85,7 @@ func initCmdOptions() {
 		HTTPPort:         0,
 		PushGatewayAddrs: "",
 		PushInterval:     10,
-		LocalCfgFile:     "/etc/clickhouse_sinker.json",
+		LocalCfgFile:     "/etc/clickhouse_sinker.hjson",
 		NacosAddr:        "127.0.0.1:8848",
 		NacosNamespaceID: "",
 		NacosGroup:       "DEFAULT_GROUP",
@@ -215,6 +216,14 @@ func main() {
 
 		var rcm cm.RemoteConfManager
 		var properties map[string]interface{}
+		logDir := "."
+		logPaths := strings.Split(cmdOps.LogPaths, ",")
+		for _, logPath := range logPaths {
+			if logPath != "stdout" && logPath != "stderr" {
+				logDir, _ = filepath.Split(logPath)
+			}
+		}
+		logDir, _ = filepath.Abs(logDir)
 		if cmdOps.NacosDataID != "" {
 			util.Logger.Info(fmt.Sprintf("get config from nacos serverAddrs %s, namespaceId %s, group %s, dataId %s",
 				cmdOps.NacosAddr, cmdOps.NacosNamespaceID, cmdOps.NacosGroup, cmdOps.NacosDataID))
@@ -227,6 +236,7 @@ func main() {
 			properties["group"] = cmdOps.NacosGroup
 			properties["dataId"] = cmdOps.NacosDataID
 			properties["serviceName"] = cmdOps.NacosServiceName
+			properties["logDir"] = logDir
 		} else {
 			util.Logger.Info(fmt.Sprintf("get config from local file %s", cmdOps.LocalCfgFile))
 		}
@@ -412,7 +422,7 @@ func (s *Sinker) applyFirstConfig(newCfg *config.Config) (err error) {
 	// 1. Initialize clickhouse connections
 	chCfg := &newCfg.Clickhouse
 	if err = pool.InitClusterConn(chCfg.Hosts, chCfg.Port, chCfg.DB, chCfg.Username, chCfg.Password,
-		chCfg.DsnParams, chCfg.Secure, chCfg.InsecureSkipVerify, chCfg.MaxOpenConns); err != nil {
+		chCfg.DsnParams, chCfg.Secure, chCfg.InsecureSkipVerify, chCfg.MaxOpenConns, chCfg.DialTimeout); err != nil {
 		return
 	}
 
@@ -448,7 +458,7 @@ func (s *Sinker) applyAnotherConfig(newCfg *config.Config) (err error) {
 		// 2. Initialize clickhouse connections.
 		chCfg := &newCfg.Clickhouse
 		if err = pool.InitClusterConn(chCfg.Hosts, chCfg.Port, chCfg.DB, chCfg.Username, chCfg.Password,
-			chCfg.DsnParams, chCfg.Secure, chCfg.InsecureSkipVerify, chCfg.MaxOpenConns); err != nil {
+			chCfg.DsnParams, chCfg.Secure, chCfg.InsecureSkipVerify, chCfg.MaxOpenConns, chCfg.DialTimeout); err != nil {
 			return
 		}
 

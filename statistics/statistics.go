@@ -1,10 +1,11 @@
-/*Copyright [2019] housepower
+/*
+Copyright [2019] housepower
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-   http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,11 +21,11 @@ import (
 	"time"
 
 	"github.com/housepower/clickhouse_sinker/util"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/push"
 	"github.com/prometheus/common/expfmt"
+	"github.com/thanos-io/thanos/pkg/errors"
 	"go.uber.org/zap"
 )
 
@@ -109,10 +110,10 @@ var (
 		},
 		[]string{"task", "topic", "partition"},
 	)
-	ClickhouseReconnectTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: prefix + "clickhouse_reconnect_total",
-			Help: "total num of ClickHouse reconnects",
+	ParsedRingMsgs = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: prefix + "parsed_ring_msgs",
+			Help: "num of parsed msgs in ring",
 		},
 		[]string{"task"},
 	)
@@ -144,6 +145,50 @@ var (
 		},
 		[]string{"task"},
 	)
+	WritingDurations = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    prefix + "writing_durations",
+			Help:    "writing durations",
+			Buckets: []float64{1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0},
+		},
+		[]string{"task", "table"},
+	)
+	WriteSeriesAllowNew = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: prefix + "write_series_allow_new",
+			Help: "num of allowed new series",
+		},
+		[]string{"task"},
+	)
+	WriteSeriesAllowChanged = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: prefix + "write_series_allow_changed",
+			Help: "num of allowed changed series",
+		},
+		[]string{"task"},
+	)
+	WriteSeriesDropQuota = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: prefix + "write_series_drop_quota",
+			Help: "num of disallowed write_series due to quota",
+		},
+		[]string{"task"},
+	)
+	WriteSeriesDropUnchanged = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: prefix + "write_series_drop_unchanged",
+			Help: "num of disallowed write_series due to unchanged",
+		},
+		[]string{"task"},
+	)
+	// WriteSeriesSucceed = WriteSeriesAllowNew + WriteSeriesAllowChanged
+	WriteSeriesSucceed = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: prefix + "write_series_succeed",
+			Help: "num of series handled by writeSeries",
+		},
+		[]string{"task"},
+	)
 )
 
 func init() {
@@ -158,11 +203,17 @@ func init() {
 	prometheus.MustRegister(FlushMsgsTotal)
 	prometheus.MustRegister(FlushMsgsErrorTotal)
 	prometheus.MustRegister(ConsumeOffsets)
-	prometheus.MustRegister(ClickhouseReconnectTotal)
+	prometheus.MustRegister(ParsedRingMsgs)
 	prometheus.MustRegister(RingMsgs)
 	prometheus.MustRegister(ShardMsgs)
 	prometheus.MustRegister(ParsingPoolBacklog)
 	prometheus.MustRegister(WritingPoolBacklog)
+	prometheus.MustRegister(WritingDurations)
+	prometheus.MustRegister(WriteSeriesAllowNew)
+	prometheus.MustRegister(WriteSeriesAllowChanged)
+	prometheus.MustRegister(WriteSeriesDropQuota)
+	prometheus.MustRegister(WriteSeriesDropUnchanged)
+	prometheus.MustRegister(WriteSeriesSucceed)
 	prometheus.MustRegister(collectors.NewBuildInfoCollector())
 }
 
@@ -189,7 +240,7 @@ func NewPusher(addrs []string, interval int, selfAddr string) *Pusher {
 }
 
 var (
-	errPgwEmpty = errors.New("invalid configuration for pusher")
+	errPgwEmpty = errors.Newf("invalid configuration for pusher")
 )
 
 func (p *Pusher) Init() error {
@@ -253,11 +304,12 @@ func (p *Pusher) reconnect() {
 		Collector(FlushMsgsTotal).
 		Collector(FlushMsgsErrorTotal).
 		Collector(ConsumeOffsets).
-		Collector(ClickhouseReconnectTotal).
 		Collector(RingMsgs).
+		Collector(ParsedRingMsgs).
 		Collector(ShardMsgs).
 		Collector(ParsingPoolBacklog).
 		Collector(WritingPoolBacklog).
+		Collector(WritingDurations).
 		Grouping("instance", p.instance).Format(expfmt.FmtText)
 	p.inUseAddr = nextAddr
 }

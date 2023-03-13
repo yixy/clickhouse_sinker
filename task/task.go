@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,7 +33,7 @@ import (
 	"github.com/housepower/clickhouse_sinker/parser"
 	"github.com/housepower/clickhouse_sinker/statistics"
 	"github.com/housepower/clickhouse_sinker/util"
-	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
@@ -46,13 +48,16 @@ type Service struct {
 	taskCfg    *config.TaskConfig
 	whiteList  *regexp.Regexp
 	blackList  *regexp.Regexp
+	lblBlkList *regexp.Regexp
 	dims       []*model.ColumnWithType
+	numDims    int
 
 	idxSerID int
 	nameKey  string
 
 	knownKeys  sync.Map
 	newKeys    sync.Map
+	warnKeys   sync.Map
 	cntNewKeys int32 // size of newKeys
 	tid        goetty.Timeout
 
@@ -86,6 +91,9 @@ func NewTaskService(cfg *config.Config, taskCfg *config.TaskConfig) (service *Se
 	if taskCfg.DynamicSchema.BlackList != "" {
 		service.blackList = regexp.MustCompile(taskCfg.DynamicSchema.BlackList)
 	}
+	if taskCfg.PromLabelsBlackList != "" {
+		service.lblBlkList = regexp.MustCompile(taskCfg.PromLabelsBlackList)
+	}
 	return
 }
 
@@ -100,6 +108,7 @@ func (service *Service) Init() (err error) {
 	}
 
 	service.dims = service.clickhouse.Dims
+	service.numDims = len(service.dims)
 	service.idxSerID = service.clickhouse.IdxSerID
 	service.nameKey = service.clickhouse.NameKey
 	service.limiter1 = rate.NewLimiter(rate.Every(10*time.Second), 1)
@@ -151,7 +160,7 @@ func (service *Service) Run() {
 			if errors.Is(err, goetty.ErrSystemStopped) {
 				util.Logger.Info("Service.Run scheduling timer to a stopped timer wheel")
 			} else {
-				err = errors.Wrap(err, "")
+				err = errors.Wrapf(err, "")
 				util.Logger.Fatal("scheduling timer filed", zap.String("task", taskCfg.Name), zap.Error(err))
 			}
 		}
@@ -291,9 +300,9 @@ func (service *Service) put(msg *model.InputMessage) {
 					msg.Topic, msg.Partition, msg.Offset), zap.String("message value", string(msg.Value)), zap.String("task", taskCfg.Name), zap.Error(err))
 			}
 		} else {
-			row = model.MetricToRow(metric, msg, service.dims, service.idxSerID, service.nameKey)
+			row = service.metric2Row(metric, msg)
 			if taskCfg.DynamicSchema.Enable {
-				foundNewKeys = metric.GetNewKeys(&service.knownKeys, &service.newKeys, service.whiteList, service.blackList)
+				foundNewKeys = metric.GetNewKeys(&service.knownKeys, &service.newKeys, &service.warnKeys, service.whiteList, service.blackList, msg.Partition, msg.Offset)
 			}
 			// Dumping message and result
 			//util.Logger.Debug("parsed kafka message", zap.Int("partition", msg.Partition), zap.Int64("offset", msg.Offset),
@@ -319,7 +328,7 @@ func (service *Service) put(msg *model.InputMessage) {
 					if errors.Is(err, goetty.ErrSystemStopped) {
 						util.Logger.Info("Service.put scheduling timer to a stopped timer wheel")
 					} else {
-						err = errors.Wrap(err, "")
+						err = errors.Wrapf(err, "")
 						util.Logger.Fatal("scheduling timer failed", zap.String("task", taskCfg.Name), zap.Error(err))
 					}
 				}
@@ -413,4 +422,60 @@ func (service *Service) Stop() {
 
 	service.wgRun.Wait()
 	util.Logger.Debug("stopped task", zap.String("task", taskCfg.Name))
+}
+
+func (service *Service) metric2Row(metric model.Metric, msg *model.InputMessage) (row *model.Row) {
+	row = model.GetRow()
+	if service.idxSerID >= 0 {
+		var seriesID, mgmtID int64
+		var labels []string
+		// If some labels are not Prometheus native, ETL shall calculate and pass "__series_id" and "__mgmt_id".
+		val := metric.GetInt64("__series_id", false)
+		seriesID = val.(int64)
+		val = metric.GetInt64("__mgmt_id", false)
+		mgmtID = val.(int64)
+		for i := 0; i < service.idxSerID; i++ {
+			dim := service.dims[i]
+			val := model.GetValueByType(metric, dim)
+			*row = append(*row, val)
+		}
+		*row = append(*row, seriesID) // __series_id
+		newSeries := service.clickhouse.AllowWriteSeries(seriesID, mgmtID)
+		if newSeries {
+			*row = append(*row, mgmtID, nil) // __mgmt_id, labels
+			for i := service.idxSerID + 3; i < service.numDims; i++ {
+				dim := service.dims[i]
+				val := model.GetValueByType(metric, dim)
+				*row = append(*row, val)
+				if val != nil && dim.Type.Type == model.String && dim.Name != service.nameKey && dim.Name != "le" && (service.lblBlkList == nil || !service.lblBlkList.MatchString(dim.Name)) {
+					// "labels" JSON excludes "le", so that "labels" can be used as group key for histogram queries.
+					labelVal := val.(string)
+					labels = append(labels, fmt.Sprintf(`%s: %s`, strconv.Quote(dim.Name), strconv.Quote(labelVal)))
+				}
+			}
+			(*row)[service.idxSerID+2] = fmt.Sprintf("{%s}", strings.Join(labels, ", "))
+		}
+	} else {
+		for _, dim := range service.dims {
+			if strings.HasPrefix(dim.Name, "__kafka") {
+				if strings.HasSuffix(dim.Name, "_topic") {
+					*row = append(*row, msg.Topic)
+				} else if strings.HasSuffix(dim.Name, "_partition") {
+					*row = append(*row, msg.Partition)
+				} else if strings.HasSuffix(dim.Name, "_offset") {
+					*row = append(*row, msg.Offset)
+				} else if strings.HasSuffix(dim.Name, "_key") {
+					*row = append(*row, string(msg.Key))
+				} else if strings.HasSuffix(dim.Name, "_timestamp") {
+					*row = append(*row, *msg.Timestamp)
+				} else {
+					*row = append(*row, nil)
+				}
+			} else {
+				val := model.GetValueByType(metric, dim)
+				*row = append(*row, val)
+			}
+		}
+	}
+	return
 }

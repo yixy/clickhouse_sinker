@@ -30,7 +30,7 @@ CREATE TABLE apache_access_log ON CLUSTER abc (
 	xforwardfor LowCardinality(String)
 ) ENGINE=ReplicatedMergeTree('/clickhouse/tables/{cluster}/{database}/{table}/{shard}', '{replica}')
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (timestamp, `@hostname`, `@path`, `@lineno`);
+ORDER BY (`@hostname`, `@path`, `@lineno`, timestamp);
 
 CREATE TABLE dist_apache_access_log ON CLUSTER abc AS apache_access_log ENGINE = Distributed(abc, default, apache_access_log);
 
@@ -52,10 +52,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Shopify/sarama"
 	"github.com/google/gops/agent"
 	"github.com/housepower/clickhouse_sinker/util"
-	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/errors"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.uber.org/zap"
 )
 
@@ -174,7 +174,7 @@ func (g *LogGenerator) Init() error {
 		}
 	}
 	if g.logfiles == nil || len(g.logfiles) == 0 {
-		err := errors.Errorf("There is no files under %v match pattern %v", LogfileDir, LogfilePattern)
+		err := errors.Newf("There is no files under %v match pattern %v", LogfileDir, LogfilePattern)
 		return err
 	}
 	sort.Strings(g.logfiles)
@@ -194,22 +194,17 @@ func (g *LogGenerator) next() (err error) {
 		g.reader = nil
 	}
 	g.lineno = 0
-	for i := 0; i < len(g.logfiles); i++ {
-		// a log file may disappear, retry another log file
-		g.off = (g.off + 1) % len(g.logfiles)
-		g.fp = g.logfiles[g.off]
-		var reader *os.File
-		if reader, err = os.Open(g.fp); err == nil {
-			g.reader = reader
-			g.scanner = bufio.NewScanner(g.reader)
-			util.Logger.Debug(fmt.Sprintf("scanning %+v", g.fp))
-			return nil
-		}
+	// a log file may disappear, retry another log file
+	g.off = (g.off + 1) % len(g.logfiles)
+	g.fp = g.logfiles[g.off]
+	var reader *os.File
+	if reader, err = os.Open(g.fp); err != nil {
 		err = errors.Wrapf(err, "")
 		util.Logger.Fatal("os.Open failed", zap.String("path", g.fp), zap.Error(err))
-		time.Sleep(6000 * time.Second)
 	}
-	err = errors.Errorf("no readable file")
+	g.reader = reader
+	g.scanner = bufio.NewScanner(g.reader)
+	util.Logger.Debug(fmt.Sprintf("scanning %+v", g.fp))
 	return
 }
 
@@ -234,14 +229,24 @@ func (g *LogGenerator) Run() {
 	rounded := time.Date(toRound.Year(), toRound.Month(), toRound.Day(), 0, 0, 0, 0, toRound.Location())
 
 	wp := util.NewWorkerPool(10, 10000)
-	config := sarama.NewConfig()
-	config.Version = sarama.V2_1_0_0
-	w, err := sarama.NewAsyncProducer(strings.Split(KafkaBrokers, ","), config)
-	if err != nil {
-		util.Logger.Fatal("sarama.NewAsyncProducer failed", zap.Error(err))
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(strings.Split(KafkaBrokers, ",")...),
 	}
-	defer w.Close()
-	chInput := w.Input()
+	var err error
+	var cl *kgo.Client
+	if cl, err = kgo.NewClient(opts...); err != nil {
+		util.Logger.Fatal("kgo.NewClient failed", zap.Error(err))
+	}
+	defer cl.Close()
+
+	ctx := context.Background()
+	produceCb := func(rec *kgo.Record, err error) {
+		if err != nil {
+			util.Logger.Fatal("kgo.Client.Produce failed", zap.Error(err))
+		}
+		atomic.AddInt64(&g.lines, int64(1))
+		atomic.AddInt64(&g.size, int64(len(rec.Value)))
+	}
 
 	var b []byte
 	for day := 0; ; day++ {
@@ -278,17 +283,15 @@ func (g *LogGenerator) Run() {
 				Xforwardfor:     "",
 			}
 			_ = wp.Submit(func() {
-				if b, err = util.JsonMarshal(&logObj); err != nil {
+				if b, err = JSONMarshal(&logObj); err != nil {
 					err = errors.Wrapf(err, "")
 					util.Logger.Fatal("got error", zap.Error(err))
 				}
-				chInput <- &sarama.ProducerMessage{
+				cl.Produce(ctx, &kgo.Record{
 					Topic: KafkaTopic,
-					Key:   sarama.StringEncoder(logObj.Hostname),
-					Value: sarama.ByteEncoder(b),
-				}
-				atomic.AddInt64(&g.lines, int64(1))
-				atomic.AddInt64(&g.size, int64(len(b)))
+					Key:   []byte(logObj.Hostname),
+					Value: b,
+				}, produceCb)
 			})
 		}
 	}
@@ -300,7 +303,7 @@ func main() {
 		usage := fmt.Sprintf(`Usage of %s
     %s kakfa_brokers topic log_file_dir log_file_pattern
 This util read log from given paths, fill some fields with random content, serialize and send to kafka.
-kakfa_brokers: for example, 192.168.102.114:9092,192.168.102.115:9092
+kakfa_brokers: for example, 192.168.110.8:9092,192.168.110.12:9092,192.168.110.16:9092
 topic: for example, apache_access_log
 log_file_dir: log file directory, for example, /var/log
 log_file_pattern: file name pattern, for example, '^secure.*$'`, os.Args[0], os.Args[0])

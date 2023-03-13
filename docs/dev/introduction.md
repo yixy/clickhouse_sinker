@@ -35,7 +35,6 @@ Refers to [design](./design.md) for how it works.
 - [x] Enum
 - [x] Array(T), where T is one of above basic types
 - [x] Nullable(T), where T is one of above basic types
-- [x] [ElasticDateTime](https://www.elastic.co/guide/en/elasticsearch/reference/current/date.html) => Int64 (2019-12-16T12:10:30Z => 1576498230)
 
 Note:
 
@@ -45,6 +44,7 @@ Note:
 
 | ClickHouse data type | default value | compatible Json data type           | valid range                           |
 |:--------------------:|:-------------:|:-----------------------------------:|:-------------------------------------:|
+| Bool                 | false         | Bool                                | false, true                           |
 | Int8, Int16, ...     | 0             | Bool, Number                        | Int8 [-128,127], ...                  |
 | Float32, Float64     | 0.0           | Number                              | Float32 [-MaxFloat32,MaxFloat32], ... |
 | Decimal, ...         | 0.0           | Number                              | [decimal-value-ranges](https://clickhouse.tech/docs/en/sql-reference/data-types/decimal/#decimal-value-ranges) |
