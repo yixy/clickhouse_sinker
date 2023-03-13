@@ -166,7 +166,7 @@ func (k *KafkaFranz) Run() {
 	k.wgRun.Add(1)
 	defer k.wgRun.Done()
 	for {
-		fetches := k.cl.PollFetches(k.ctx, util.MaxPollRecords)
+		fetches := k.cl.PollRecords(k.ctx, util.MaxPollRecords)
 		err := fetches.Err()
 		if fetches == nil || fetches.IsClientClosed() || errors.Is(err, context.Canceled) {
 			break
